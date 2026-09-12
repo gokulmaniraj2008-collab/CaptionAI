@@ -63,8 +63,6 @@ function parseSegments(raw: string) {
 }
 
 export async function POST(req: Request) {
-  let uploadedFileName: string | undefined;
-
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -116,15 +114,21 @@ export async function POST(req: Request) {
           displayName: video.name || "captionai-video"
         }
       });
-      uploadedFileName = uploaded.name;
 
+      if (!uploaded.name) {
+        throw new Error("Gemini Files API did not return an uploaded file name.");
+      }
+
+      const uploadedFileName = uploaded.name;
       let ready = uploaded;
+
       while (ready.state === "PROCESSING") {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        ready = await ai.files.get({ name: uploaded.name });
+        ready = await ai.files.get({ name: uploadedFileName });
       }
 
       if (ready.state !== "ACTIVE" || !ready.uri || !ready.mimeType) {
+        await ai.files.delete({ name: uploadedFileName }).catch(() => undefined);
         throw new Error("Gemini video processing failed.");
       }
 
@@ -136,6 +140,9 @@ export async function POST(req: Request) {
           responseSchema: captionSchema
         }
       });
+
+      // Uploaded Gemini files are temporary for this request; clean them up.
+      await ai.files.delete({ name: uploadedFileName }).catch(() => undefined);
     }
 
     const segments = parseSegments(response.text || "{\"segments\":[]}");
