@@ -3,6 +3,20 @@ import { GoogleGenAI } from "@google/genai";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+const LANGUAGES: Record<string, string> = {
+  auto: "the video's spoken language (auto-detect it)",
+  en: "English",
+  ta: "Tamil",
+  hi: "Hindi",
+  te: "Telugu",
+  ml: "Malayalam",
+  kn: "Kannada",
+  bn: "Bengali",
+  mr: "Marathi",
+  gu: "Gujarati",
+  pa: "Punjabi"
+};
+
 const captionSchema = {
   type: "object",
   properties: {
@@ -13,7 +27,7 @@ const captionSchema = {
         properties: {
           start: { type: "number", description: "Start time in seconds." },
           end: { type: "number", description: "End time in seconds." },
-          text: { type: "string", description: "Exact spoken English words for this segment." }
+          text: { type: "string", description: "Caption text in the requested language." }
         },
         required: ["start", "end", "text"]
       }
@@ -31,6 +45,9 @@ export async function POST(req: Request) {
 
     const form = await req.formData();
     const video = form.get("video");
+    const requestedLanguage = String(form.get("language") || "en");
+    const targetLanguage = LANGUAGES[requestedLanguage] || LANGUAGES.en;
+
     if (!(video instanceof File)) {
       return Response.json({ error: "Video file is required." }, { status: 400 });
     }
@@ -52,7 +69,10 @@ export async function POST(req: Request) {
           }
         },
         {
-          text: `Create accurate English subtitles for this video. Transcribe only spoken words, preserving the actual wording. Split the transcript into natural caption-sized segments. For every segment, provide start and end timestamps in seconds based on the video's timeline. Do not invent speech. If there is no speech, return an empty segments array.`
+          text: `Create accurate synchronized subtitles for this video in ${targetLanguage}. ${requestedLanguage === "auto"
+            ? "First detect the language actually spoken in the video and write the captions in that spoken language."
+            : "Translate the spoken content into the requested language while preserving the meaning naturally."
+          } Transcribe only spoken words. Split the transcript into natural caption-sized segments. For every segment, provide start and end timestamps in seconds based on the video's timeline. Do not invent speech. Keep names, numbers and technical terms accurate. If there is no speech, return an empty segments array.`
         }
       ],
       config: {
@@ -74,6 +94,7 @@ export async function POST(req: Request) {
       : [];
 
     return Response.json({
+      language: requestedLanguage,
       text: segments.map((s: any) => s.text).join(" "),
       segments
     });
