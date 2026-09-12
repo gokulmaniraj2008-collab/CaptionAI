@@ -31,17 +31,42 @@ export default function CaptionStudio() {
   const [exporting, setExporting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [language, setLanguage] = useState("en");
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [style, setStyle] = useState<Style>({ fontSize: 28, x: 50, y: 84, background: true });
   const videoRef = useRef<HTMLVideoElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
 
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === previewRef.current);
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+
   const active = useMemo(
     () => segments.find((s) => currentTime >= s.start && currentTime <= s.end)?.text ?? "",
     [segments, currentTime]
   );
   const selectedLanguage = LANGUAGES.find((item) => item.code === language)?.label ?? "English";
+
+  async function toggleFullscreen() {
+    const preview = previewRef.current;
+    if (!preview) return;
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else if (preview.requestFullscreen) {
+        await preview.requestFullscreen();
+      } else {
+        setStatus("Fullscreen mode is not supported by this browser.");
+      }
+    } catch {
+      setStatus("Could not enter fullscreen mode. Please try again.");
+    }
+  }
 
   async function transcribe() {
     if (!video) return;
@@ -50,8 +75,6 @@ export default function CaptionStudio() {
     setStatus("Uploading video directly to secure storage…");
 
     try {
-      // IMPORTANT: the video never enters a Vercel Function request body.
-      // Vercel Blob streams the browser upload directly and supports multipart uploads.
       const blob = await upload(`captionai/${Date.now()}-${video.name}`, video, {
         access: "public",
         handleUploadUrl: "/api/upload",
@@ -66,12 +89,7 @@ export default function CaptionStudio() {
       const res = await fetch("/api/transcribe", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          videoUrl: blob.url,
-          videoType: video.type || "video/mp4",
-          videoName: video.name,
-          language
-        })
+        body: JSON.stringify({ videoUrl: blob.url, videoType: video.type || "video/mp4", videoName: video.name, language })
       });
 
       const contentType = res.headers.get("content-type") || "";
@@ -79,9 +97,7 @@ export default function CaptionStudio() {
       let data: { error?: string; segments?: Segment[] } = {};
       if (contentType.includes("application/json")) {
         try { data = JSON.parse(raw); } catch { data = { error: "The server returned invalid JSON." }; }
-      } else if (raw.trim()) {
-        data = { error: raw.trim() };
-      }
+      } else if (raw.trim()) data = { error: raw.trim() };
 
       if (!res.ok) throw new Error(data.error || `Caption request failed with HTTP ${res.status}`);
       if (!data.segments) throw new Error("Gemini returned an unexpected response.");
@@ -92,9 +108,7 @@ export default function CaptionStudio() {
       const message = e?.message || "Something went wrong";
       if (/BLOB|token|upload/i.test(message) && !message.includes("Caption generation failed")) {
         setStatus(`Video upload failed: ${message}. Make sure a Vercel Blob store is connected to this project.`);
-      } else {
-        setStatus(message);
-      }
+      } else setStatus(message);
     } finally {
       setBusy(false);
       setUploadProgress(0);
@@ -253,9 +267,12 @@ export default function CaptionStudio() {
             </label>
           ) : (
             <>
-              <div className="preview" ref={previewRef}>
+              <div className={`preview ${isFullscreen ? "previewFullscreen" : ""}`} ref={previewRef}>
                 <video ref={videoRef} src={url} controls onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)} />
                 {active && <div className="caption draggable" onPointerDown={startDrag} onPointerMove={drag} style={{ left: `${style.x}%`, top: `${style.y}%`, fontSize: style.fontSize, background: style.background ? "rgba(0,0,0,.72)" : "transparent" }}>{active}</div>}
+                <button className="fullscreenButton" type="button" onClick={toggleFullscreen} disabled={exporting} aria-label={isFullscreen ? "Exit fullscreen" : "Open fullscreen editor"}>
+                  {isFullscreen ? "✕ Exit" : "⛶ Full Screen"}
+                </button>
               </div>
               <div className="languagePicker">
                 <label htmlFor="caption-language">Caption language</label>
