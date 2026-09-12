@@ -1,5 +1,7 @@
 import { handleUpload } from "@vercel/blob/client";
 
+const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -9,7 +11,7 @@ export async function POST(request: Request) {
       request,
       onBeforeGenerateToken: async () => ({
         allowedContentTypes: ["video/*"],
-        maximumSizeInBytes: 5 * 1024 * 1024 * 1024,
+        maximumSizeInBytes: MAX_VIDEO_BYTES,
         addRandomSuffix: true
       }),
       onUploadCompleted: async () => {
