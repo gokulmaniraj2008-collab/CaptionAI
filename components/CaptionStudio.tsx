@@ -20,6 +20,8 @@ const LANGUAGES: Language[] = [
   { code: "pa", label: "ਪੰਜਾਬੀ (Punjabi)" }
 ];
 
+const CAPTION_API_URL = process.env.NEXT_PUBLIC_CAPTIONAI_FUNCTION_URL;
+
 export default function CaptionStudio() {
   const [video, setVideo] = useState<File | null>(null);
   const [url, setUrl] = useState("");
@@ -61,22 +63,40 @@ export default function CaptionStudio() {
 
   async function transcribe() {
     if (!video) return;
+    if (!CAPTION_API_URL) {
+      setStatus("Caption backend is not configured. Add NEXT_PUBLIC_CAPTIONAI_FUNCTION_URL in Vercel.");
+      return;
+    }
+
     setBusy(true);
-    setStatus("Uploading video securely to the caption API…");
+    setStatus("Requesting a secure upload URL…");
     try {
-      const form = new FormData();
-      form.append("video", video, video.name);
-      form.append("language", language);
+      const uploadRes = await fetch(`${CAPTION_API_URL}/upload-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: video.name, type: video.type, size: video.size })
+      });
+      const uploadData = await uploadRes.json().catch(() => ({}));
+      if (!uploadRes.ok || !uploadData.uploadUrl || !uploadData.objectKey) {
+        throw new Error(uploadData.error || `Could not prepare upload (HTTP ${uploadRes.status}).`);
+      }
 
-      const res = await fetch("/api/transcribe", { method: "POST", body: form });
-      const contentType = res.headers.get("content-type") || "";
-      const raw = await res.text();
-      let data: { error?: string; segments?: Segment[] } = {};
-      if (contentType.includes("application/json")) {
-        try { data = JSON.parse(raw); } catch { data = { error: "The server returned invalid JSON." }; }
-      } else if (raw.trim()) data = { error: raw.trim() };
+      setStatus("Uploading video directly to secure storage…");
+      const putRes = await fetch(uploadData.uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": video.type || "application/octet-stream" },
+        body: video
+      });
+      if (!putRes.ok) throw new Error(`Video upload failed with HTTP ${putRes.status}.`);
 
-      if (!res.ok) throw new Error(data.error || `Caption request failed with HTTP ${res.status}`);
+      setStatus("Upload complete — Gemini is processing your captions…");
+      const transcribeRes = await fetch(`${CAPTION_API_URL}/transcribe`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ objectKey: uploadData.objectKey, language })
+      });
+      const data = await transcribeRes.json().catch(() => ({}));
+      if (!transcribeRes.ok) throw new Error(data.error || `Caption request failed with HTTP ${transcribeRes.status}.`);
       if (!data.segments) throw new Error("Gemini returned an unexpected response.");
 
       setSegments(data.segments);
@@ -238,7 +258,7 @@ export default function CaptionStudio() {
       <nav className="nav"><div className="logo">Caption<span>AI</span></div><div className="pill">GEMINI AI VIDEO CAPTIONS</div></nav>
       <section className="hero">
         <div>
-          <p className="eyebrow">VIDEO → GEMINI AI → MULTILINGUAL CAPTIONS</p>
+          <p className="eyebrow">VIDEO → SECURE STORAGE → GEMINI AI → MULTILINGUAL CAPTIONS</p>
           <h1>Make every word<br /><span>easy to follow.</span></h1>
           <p className="lead">Upload a video, choose a language, and Gemini creates synchronized captions.</p>
         </div>
