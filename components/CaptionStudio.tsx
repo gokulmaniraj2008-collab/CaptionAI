@@ -3,8 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type Segment = { start: number; end: number; text: string };
-type Style = { fontSize: number; position: "bottom" | "center" | "top"; background: boolean };
-
+type Style = { fontSize: number; x: number; y: number; background: boolean };
 type Language = { code: string; label: string };
 
 const LANGUAGES: Language[] = [
@@ -28,9 +27,11 @@ export default function CaptionStudio() {
   const [currentTime, setCurrentTime] = useState(0);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [language, setLanguage] = useState("en");
-  const [style, setStyle] = useState<Style>({ fontSize: 28, position: "bottom", background: true });
+  const [style, setStyle] = useState<Style>({ fontSize: 28, x: 50, y: 84, background: true });
   const videoRef = useRef<HTMLVideoElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
 
@@ -75,10 +76,138 @@ export default function CaptionStudio() {
       return `${i + 1}\n${tc(s.start)} --> ${tc(s.end)}\n${s.text}\n`;
     }).join("\n");
 
+    const blobUrl = URL.createObjectURL(new Blob([srt], { type: "text/plain;charset=utf-8" }));
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([srt], { type: "text/plain;charset=utf-8" }));
+    a.href = blobUrl;
     a.download = `captions-${language}.srt`;
     a.click();
+    URL.revokeObjectURL(blobUrl);
+  }
+
+  function moveCaption(clientX: number, clientY: number) {
+    const box = previewRef.current?.getBoundingClientRect();
+    if (!box) return;
+    const x = Math.max(8, Math.min(92, ((clientX - box.left) / box.width) * 100));
+    const y = Math.max(8, Math.min(92, ((clientY - box.top) / box.height) * 100));
+    setStyle((s) => ({ ...s, x, y }));
+  }
+
+  function startDrag(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    moveCaption(e.clientX, e.clientY);
+  }
+
+  function drag(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) moveCaption(e.clientX, e.clientY);
+  }
+
+  async function exportCaptionedVideo() {
+    const source = videoRef.current;
+    if (!source || !segments.length) return;
+
+    if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+      setStatus("Video export is not supported in this browser. Try the latest Chrome or Edge.");
+      return;
+    }
+
+    setExporting(true);
+    setStatus("Rendering your captioned video in real time… keep this tab open.");
+
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = source.videoWidth || 1280;
+      canvas.height = source.videoHeight || 720;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas export is unavailable");
+
+      const canvasStream = canvas.captureStream(30);
+      const sourceStream = (source as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
+      if (!sourceStream) throw new Error("This browser cannot capture video audio for export");
+      sourceStream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
+
+      const mimeTypes = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+      const mimeType = mimeTypes.find((type) => MediaRecorder.isTypeSupported(type));
+      if (!mimeType) throw new Error("No supported WebM video format was found");
+
+      const chunks: BlobPart[] = [];
+      const recorder = new MediaRecorder(canvasStream, { mimeType, videoBitsPerSecond: 6000000 });
+      recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+
+      await source.play();
+      source.currentTime = 0;
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => { cleanup(); resolve(); };
+        const fail = () => { cleanup(); reject(new Error("Video playback failed during export")); };
+        const cleanup = () => {
+          source.removeEventListener("ended", finish);
+          source.removeEventListener("error", fail);
+        };
+        const draw = () => {
+          ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+          const segment = segments.find((s) => source.currentTime >= s.start && source.currentTime <= s.end);
+          if (segment) {
+            const fontPx = Math.max(18, Math.round((style.fontSize / 28) * canvas.height * 0.026));
+            ctx.font = `700 ${fontPx}px system-ui, sans-serif`;
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            const maxWidth = canvas.width * 0.82;
+            const words = segment.text.split(/\s+/);
+            const lines: string[] = [];
+            let line = "";
+            for (const word of words) {
+              const next = line ? `${line} ${word}` : word;
+              if (ctx.measureText(next).width > maxWidth && line) {
+                lines.push(line);
+                line = word;
+              } else line = next;
+            }
+            if (line) lines.push(line);
+            const lineHeight = fontPx * 1.2;
+            const totalHeight = lines.length * lineHeight;
+            const cx = (style.x / 100) * canvas.width;
+            const cy = (style.y / 100) * canvas.height;
+            if (style.background) {
+              const widths = lines.map((lineText) => ctx.measureText(lineText).width);
+              const bw = Math.min(maxWidth + 32, Math.max(...widths) + 32);
+              const bh = totalHeight + 22;
+              ctx.fillStyle = "rgba(0,0,0,.72)";
+              ctx.beginPath();
+              ctx.roundRect(cx - bw / 2, cy - bh / 2, bw, bh, 14);
+              ctx.fill();
+            }
+            ctx.fillStyle = "#fff";
+            lines.forEach((lineText, index) => ctx.fillText(lineText, cx, cy - totalHeight / 2 + lineHeight / 2 + index * lineHeight));
+          }
+          if (!source.ended) requestAnimationFrame(draw);
+        };
+        source.addEventListener("ended", finish, { once: true });
+        source.addEventListener("error", fail, { once: true });
+        recorder.start(250);
+        requestAnimationFrame(draw);
+      });
+
+      await new Promise<void>((resolve) => {
+        recorder.addEventListener("stop", () => resolve(), { once: true });
+        recorder.stop();
+      });
+      canvasStream.getTracks().forEach((track) => track.stop());
+      sourceStream.getTracks().forEach((track) => track.stop());
+
+      const blob = new Blob(chunks, { type: mimeType });
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `captioned-${language}.webm`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      setStatus("Done — captioned video downloaded.");
+    } catch (e: any) {
+      setStatus(e.message || "Video export failed");
+    } finally {
+      setExporting(false);
+      source.pause();
+    }
   }
 
   function choose(file: File) {
@@ -89,6 +218,7 @@ export default function CaptionStudio() {
     setSegments([]);
     setCurrentTime(0);
     setStatus("");
+    setStyle({ fontSize: 28, x: 50, y: 84, background: true });
   }
 
   return (
@@ -110,34 +240,32 @@ export default function CaptionStudio() {
             </label>
           ) : (
             <>
-              <div className="preview">
-                <video
-                  ref={videoRef}
-                  src={url}
-                  controls
-                  onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)}
-                />
-                {active && <div className={`caption ${style.position}`} style={{ fontSize: style.fontSize, background: style.background ? "rgba(0,0,0,.72)" : "transparent" }}>{active}</div>}
+              <div className="preview" ref={previewRef}>
+                <video ref={videoRef} src={url} controls onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime ?? 0)} />
+                {active && <div className="caption draggable" onPointerDown={startDrag} onPointerMove={drag} style={{ left: `${style.x}%`, top: `${style.y}%`, fontSize: style.fontSize, background: style.background ? "rgba(0,0,0,.72)" : "transparent" }}>{active}</div>}
               </div>
 
               <div className="languagePicker">
                 <label htmlFor="caption-language">Caption language</label>
-                <select id="caption-language" value={language} onChange={(e) => { setLanguage(e.target.value); setSegments([]); setStatus(""); }} disabled={busy}>
+                <select id="caption-language" value={language} onChange={(e) => { setLanguage(e.target.value); setSegments([]); setStatus(""); }} disabled={busy || exporting}>
                   {LANGUAGES.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}
                 </select>
                 <small>Choose the subtitle language. Auto Detect keeps the language spoken in the video.</small>
               </div>
 
               <div className="controls">
-                <button className="primary" disabled={busy} onClick={transcribe}>{busy ? "Gemini is processing…" : `Generate ${selectedLanguage} captions`}</button>
-                {segments.length > 0 && <button onClick={downloadSrt}>Download SRT</button>}
-                <button onClick={() => { setVideo(null); setSegments([]); setUrl(""); setStatus(""); }}>Change video</button>
+                <button className="primary" disabled={busy || exporting} onClick={transcribe}>{busy ? "Gemini is processing…" : `Generate ${selectedLanguage} captions`}</button>
+                {segments.length > 0 && <button disabled={exporting} onClick={exportCaptionedVideo}>{exporting ? "Rendering video…" : "Download Video + Text"}</button>}
+                {segments.length > 0 && <button disabled={exporting} onClick={downloadSrt}>Download SRT</button>}
+                <button disabled={exporting} onClick={() => { setVideo(null); setSegments([]); setUrl(""); setStatus(""); }}>Change video</button>
               </div>
+
               {segments.length > 0 && <div className="editor">
-                <h3>Caption style</h3>
+                <h3>Edit caption position & style</h3>
+                <p>Drag the caption directly on the video preview. The position is used in the exported video.</p>
                 <label>Size <input type="range" min="18" max="54" value={style.fontSize} onChange={(e) => setStyle({ ...style, fontSize: +e.target.value })} /></label>
-                <label>Position <select value={style.position} onChange={(e) => setStyle({ ...style, position: e.target.value as Style["position"] })}><option value="bottom">Bottom</option><option value="center">Center</option><option value="top">Top</option></select></label>
                 <label><input type="checkbox" checked={style.background} onChange={(e) => setStyle({ ...style, background: e.target.checked })} /> Background</label>
+                <button onClick={() => setStyle({ ...style, x: 50, y: 84 })}>Reset position</button>
               </div>}
               <p className="status">{status}</p>
             </>
@@ -146,8 +274,8 @@ export default function CaptionStudio() {
       </section>
       <section className="features">
         <div><b>01</b><h3>Gemini transcription</h3><p>Gemini analyzes the uploaded video and creates timestamped captions in your selected language.</p></div>
-        <div><b>02</b><h3>Multilingual preview</h3><p>Preview English, Tamil, Hindi and other supported languages directly over the video.</p></div>
-        <div><b>03</b><h3>SRT export</h3><p>Download a standard UTF-8 subtitle file for editing or publishing.</p></div>
+        <div><b>02</b><h3>Drag-to-position editor</h3><p>Move captions anywhere on the preview and export the same placement as burned-in video text.</p></div>
+        <div><b>03</b><h3>Video + SRT export</h3><p>Download a captioned WebM video or a standard UTF-8 SRT subtitle file.</p></div>
       </section>
       <footer>CaptionAI • Gemini API key stays on the server.</footer>
     </main>
