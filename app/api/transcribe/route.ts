@@ -1,4 +1,3 @@
-import { del } from "@vercel/blob";
 import { createPartFromUri, GoogleGenAI } from "@google/genai";
 
 export const runtime = "nodejs";
@@ -61,15 +60,11 @@ function parseSegments(raw: string) {
 
   const firstObject = text.indexOf("{");
   const lastObject = text.lastIndexOf("}");
-  if (firstObject >= 0 && lastObject > firstObject) {
-    candidates.push(text.slice(firstObject, lastObject + 1));
-  }
+  if (firstObject >= 0 && lastObject > firstObject) candidates.push(text.slice(firstObject, lastObject + 1));
 
   const firstArray = text.indexOf("[");
   const lastArray = text.lastIndexOf("]");
-  if (firstArray >= 0 && lastArray > firstArray) {
-    candidates.push(`{"segments":${text.slice(firstArray, lastArray + 1)}}`);
-  }
+  if (firstArray >= 0 && lastArray > firstArray) candidates.push(`{"segments":${text.slice(firstArray, lastArray + 1)}}`);
 
   let parsed: any = null;
   let lastError: unknown = null;
@@ -82,127 +77,79 @@ function parseSegments(raw: string) {
     }
   }
 
-  if (!parsed) {
-    throw new Error(`Gemini returned invalid caption JSON: ${lastError instanceof Error ? lastError.message : "invalid JSON"}`);
-  }
+  if (!parsed) throw new Error(`Gemini returned invalid caption JSON: ${lastError instanceof Error ? lastError.message : "invalid JSON"}`);
 
   const source = Array.isArray(parsed) ? parsed : parsed.segments;
-  if (!Array.isArray(source)) {
-    throw new Error("Gemini returned JSON without a segments array.");
-  }
+  if (!Array.isArray(source)) throw new Error("Gemini returned JSON without a segments array.");
 
   return source
-    .map((s: any) => ({
-      start: Number(s?.start),
-      end: Number(s?.end),
-      text: String(s?.text ?? "").trim()
-    }))
+    .map((s: any) => ({ start: Number(s?.start), end: Number(s?.end), text: String(s?.text ?? "").trim() }))
     .filter((s: any) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.text)
     .sort((a: any, b: any) => a.start - b.start);
 }
 
 export async function POST(req: Request) {
-  let blobUrl = "";
   let uploadedFileName = "";
 
   try {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return Response.json({ error: "GEMINI_API_KEY is not configured." }, { status: 500 });
-    }
+    if (!apiKey) return Response.json({ error: "GEMINI_API_KEY is not configured." }, { status: 500 });
 
-    const body = await req.json();
-    blobUrl = String(body.videoUrl || "");
-    const requestedLanguage = String(body.language || "en");
+    const form = await req.formData();
+    const video = form.get("video");
+    const requestedLanguage = String(form.get("language") || "en");
     const targetLanguage = LANGUAGES[requestedLanguage] || LANGUAGES.en;
 
-    if (!blobUrl || !/^https:\/\/.+/.test(blobUrl)) {
-      return Response.json({ error: "Uploaded video URL is required." }, { status: 400 });
-    }
-
-    const videoResponse = await fetch(blobUrl, { cache: "no-store" });
-    if (!videoResponse.ok || !videoResponse.body) {
-      throw new Error(`Could not retrieve uploaded video (HTTP ${videoResponse.status}).`);
-    }
-
-    const contentType = videoResponse.headers.get("content-type") || String(body.videoType || "video/mp4");
-    if (!contentType.startsWith("video/")) {
-      throw new Error("The uploaded object is not a valid video.");
-    }
-
-    const bytes = Buffer.from(await videoResponse.arrayBuffer());
-    if (!bytes.byteLength) {
-      throw new Error("The uploaded video is empty.");
-    }
+    if (!(video instanceof File)) return Response.json({ error: "Video file is required." }, { status: 400 });
+    if (!video.type.startsWith("video/")) return Response.json({ error: "Please upload a valid video file." }, { status: 400 });
+    if (!video.size) return Response.json({ error: "The uploaded video is empty." }, { status: 400 });
 
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = PROMPT(targetLanguage, requestedLanguage);
-
     const uploaded = await ai.files.upload({
-      file: new Blob([bytes], { type: contentType }),
+      file: video,
       config: {
-        mimeType: contentType,
-        displayName: String(body.videoName || "captionai-video")
+        mimeType: video.type || "video/mp4",
+        displayName: video.name || "captionai-video"
       }
     });
 
-    if (!uploaded.name) {
-      throw new Error("Gemini Files API did not return an uploaded file name.");
-    }
-
+    if (!uploaded.name) throw new Error("Gemini Files API did not return an uploaded file name.");
     uploadedFileName = uploaded.name;
-    let ready = uploaded;
 
+    let ready = uploaded;
     while (ready.state === "PROCESSING") {
       await new Promise((resolve) => setTimeout(resolve, 2000));
       ready = await ai.files.get({ name: uploadedFileName });
     }
 
-    if (ready.state !== "ACTIVE" || !ready.uri || !ready.mimeType) {
-      throw new Error("Gemini video processing failed.");
-    }
+    if (ready.state !== "ACTIVE" || !ready.uri || !ready.mimeType) throw new Error("Gemini video processing failed.");
 
+    const prompt = PROMPT(targetLanguage, requestedLanguage);
     const contents = [createPartFromUri(ready.uri, ready.mimeType), prompt];
     let response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
       contents,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: captionSchema
-      }
+      config: { responseMimeType: "application/json", responseSchema: captionSchema }
     });
 
     let segments: ReturnType<typeof parseSegments>;
     try {
       segments = parseSegments(response.text || "");
     } catch (firstError) {
-      console.warn("Gemini returned malformed JSON; retrying once with stricter output instructions.", firstError);
+      console.warn("Gemini returned malformed JSON; retrying once.", firstError);
       response = await ai.models.generateContent({
         model: "gemini-3.8-flash",
-        contents: [
-          createPartFromUri(ready.uri, ready.mimeType),
-          `${prompt}\nThis is a retry because the previous response was not valid JSON. Output only the JSON object; do not start the response with a dash, bullet, number, or prose.`
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: captionSchema
-        }
+        contents: [createPartFromUri(ready.uri, ready.mimeType), `${prompt}\nOutput only the JSON object. Do not add prose or markdown.`],
+        config: { responseMimeType: "application/json", responseSchema: captionSchema }
       });
       segments = parseSegments(response.text || "");
     }
 
-    return Response.json({
-      language: requestedLanguage,
-      text: segments.map((s) => s.text).join(" "),
-      segments
-    });
+    return Response.json({ language: requestedLanguage, text: segments.map((s) => s.text).join(" "), segments });
   } catch (error) {
     console.error("Gemini transcription error:", error);
     const message = error instanceof Error ? error.message : "Unknown Gemini error";
-    return Response.json(
-      { error: `Caption generation failed: ${message}` },
-      { status: 500 }
-    );
+    return Response.json({ error: `Caption generation failed: ${message}` }, { status: 500 });
   } finally {
     if (uploadedFileName) {
       const apiKey = process.env.GEMINI_API_KEY;
@@ -210,9 +157,6 @@ export async function POST(req: Request) {
         const cleanupAi = new GoogleGenAI({ apiKey });
         await cleanupAi.files.delete({ name: uploadedFileName }).catch(() => undefined);
       }
-    }
-    if (blobUrl) {
-      await del(blobUrl).catch(() => undefined);
     }
   }
 }
