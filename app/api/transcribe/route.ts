@@ -45,22 +45,60 @@ ${requestedLanguage === "auto"
 Transcribe only spoken words. Split the transcript into natural caption-sized segments.
 For every segment, provide start and end timestamps in seconds based on the video's timeline.
 Do not invent speech. Keep names, numbers and technical terms accurate.
-Return an empty segments array only when the video genuinely contains no understandable speech.`;
+Return an empty segments array only when the video genuinely contains no understandable speech.
+IMPORTANT: Return exactly one JSON object with this shape and absolutely nothing else:
+{"segments":[{"start":0,"end":2.5,"text":"caption"}]}
+Do not use markdown fences, bullets, comments, or explanatory text.`;
 
 function parseSegments(raw: string) {
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  const parsed = JSON.parse(cleaned || "{\"segments\":[]}");
+  const text = String(raw || "").replace(/^\uFEFF/, "").trim();
+  if (!text) return [];
 
-  return Array.isArray(parsed.segments)
-    ? parsed.segments
-        .map((s: any) => ({
-          start: Number(s.start),
-          end: Number(s.end),
-          text: String(s.text ?? "").trim()
-        }))
-        .filter((s: any) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.text)
-        .sort((a: any, b: any) => a.start - b.start)
-    : [];
+  const candidates = [
+    text,
+    text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim()
+  ];
+
+  const firstObject = text.indexOf("{");
+  const lastObject = text.lastIndexOf("}");
+  if (firstObject >= 0 && lastObject > firstObject) {
+    candidates.push(text.slice(firstObject, lastObject + 1));
+  }
+
+  const firstArray = text.indexOf("[");
+  const lastArray = text.lastIndexOf("]");
+  if (firstArray >= 0 && lastArray > firstArray) {
+    candidates.push(`{"segments":${text.slice(firstArray, lastArray + 1)}}`);
+  }
+
+  let parsed: any = null;
+  let lastError: unknown = null;
+  for (const candidate of candidates) {
+    try {
+      parsed = JSON.parse(candidate);
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!parsed) {
+    throw new Error(`Gemini returned invalid caption JSON: ${lastError instanceof Error ? lastError.message : "invalid JSON"}`);
+  }
+
+  const source = Array.isArray(parsed) ? parsed : parsed.segments;
+  if (!Array.isArray(source)) {
+    throw new Error("Gemini returned JSON without a segments array.");
+  }
+
+  return source
+    .map((s: any) => ({
+      start: Number(s?.start),
+      end: Number(s?.end),
+      text: String(s?.text ?? "").trim()
+    }))
+    .filter((s: any) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.text)
+    .sort((a: any, b: any) => a.start - b.start);
 }
 
 export async function POST(req: Request) {
@@ -100,8 +138,6 @@ export async function POST(req: Request) {
     const ai = new GoogleGenAI({ apiKey });
     const prompt = PROMPT(targetLanguage, requestedLanguage);
 
-    // The browser uploads directly to Vercel Blob, so this route never receives
-    // the video as a request body. Gemini's Files API is used for every video.
     const uploaded = await ai.files.upload({
       file: new Blob([bytes], { type: contentType }),
       config: {
@@ -126,20 +162,38 @@ export async function POST(req: Request) {
       throw new Error("Gemini video processing failed.");
     }
 
-    const response = await ai.models.generateContent({
+    const contents = [createPartFromUri(ready.uri, ready.mimeType), prompt];
+    let response = await ai.models.generateContent({
       model: "gemini-3.8-flash",
-      contents: [createPartFromUri(ready.uri, ready.mimeType), prompt],
+      contents,
       config: {
         responseMimeType: "application/json",
         responseSchema: captionSchema
       }
     });
 
-    const segments = parseSegments(response.text || "{\"segments\":[]}");
+    let segments: ReturnType<typeof parseSegments>;
+    try {
+      segments = parseSegments(response.text || "");
+    } catch (firstError) {
+      console.warn("Gemini returned malformed JSON; retrying once with stricter output instructions.", firstError);
+      response = await ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: [
+          createPartFromUri(ready.uri, ready.mimeType),
+          `${prompt}\nThis is a retry because the previous response was not valid JSON. Output only the JSON object; do not start the response with a dash, bullet, number, or prose.`
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: captionSchema
+        }
+      });
+      segments = parseSegments(response.text || "");
+    }
 
     return Response.json({
       language: requestedLanguage,
-      text: segments.map((s: any) => s.text).join(" "),
+      text: segments.map((s) => s.text).join(" "),
       segments
     });
   } catch (error) {
