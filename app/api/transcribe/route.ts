@@ -1,3 +1,4 @@
+import { del } from "@vercel/blob";
 import { createPartFromUri, GoogleGenAI } from "@google/genai";
 
 export const runtime = "nodejs";
@@ -63,87 +64,76 @@ function parseSegments(raw: string) {
 }
 
 export async function POST(req: Request) {
+  let blobUrl = "";
+  let uploadedFileName = "";
+
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return Response.json({ error: "GEMINI_API_KEY is not configured." }, { status: 500 });
     }
 
-    const form = await req.formData();
-    const video = form.get("video");
-    const requestedLanguage = String(form.get("language") || "en");
+    const body = await req.json();
+    blobUrl = String(body.videoUrl || "");
+    const requestedLanguage = String(body.language || "en");
     const targetLanguage = LANGUAGES[requestedLanguage] || LANGUAGES.en;
 
-    if (!(video instanceof File)) {
-      return Response.json({ error: "Video file is required." }, { status: 400 });
+    if (!blobUrl || !/^https:\/\/.+/.test(blobUrl)) {
+      return Response.json({ error: "Uploaded video URL is required." }, { status: 400 });
     }
 
-    if (!video.type.startsWith("video/")) {
-      return Response.json({ error: "Please upload a valid video file." }, { status: 400 });
+    const videoResponse = await fetch(blobUrl, { cache: "no-store" });
+    if (!videoResponse.ok || !videoResponse.body) {
+      throw new Error(`Could not retrieve uploaded video (HTTP ${videoResponse.status}).`);
+    }
+
+    const contentType = videoResponse.headers.get("content-type") || String(body.videoType || "video/mp4");
+    if (!contentType.startsWith("video/")) {
+      throw new Error("The uploaded object is not a valid video.");
+    }
+
+    const bytes = Buffer.from(await videoResponse.arrayBuffer());
+    if (!bytes.byteLength) {
+      throw new Error("The uploaded video is empty.");
     }
 
     const ai = new GoogleGenAI({ apiKey });
     const prompt = PROMPT(targetLanguage, requestedLanguage);
-    const bytes = Buffer.from(await video.arrayBuffer());
 
-    // Inline video input is intended for small requests. For larger videos,
-    // use Gemini's Files API so the whole video is not embedded as base64.
-    let response;
-    if (bytes.byteLength <= 20 * 1024 * 1024) {
-      response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: [
-          {
-            inlineData: {
-              mimeType: video.type || "video/mp4",
-              data: bytes.toString("base64")
-            }
-          },
-          { text: prompt }
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: captionSchema
-        }
-      });
-    } else {
-      const uploaded = await ai.files.upload({
-        file: new Blob([bytes], { type: video.type || "video/mp4" }),
-        config: {
-          mimeType: video.type || "video/mp4",
-          displayName: video.name || "captionai-video"
-        }
-      });
-
-      if (!uploaded.name) {
-        throw new Error("Gemini Files API did not return an uploaded file name.");
+    // The browser uploads directly to Vercel Blob, so this route never receives
+    // the video as a request body. Gemini's Files API is used for every video.
+    const uploaded = await ai.files.upload({
+      file: new Blob([bytes], { type: contentType }),
+      config: {
+        mimeType: contentType,
+        displayName: String(body.videoName || "captionai-video")
       }
+    });
 
-      const uploadedFileName = uploaded.name;
-      let ready = uploaded;
-
-      while (ready.state === "PROCESSING") {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        ready = await ai.files.get({ name: uploadedFileName });
-      }
-
-      if (ready.state !== "ACTIVE" || !ready.uri || !ready.mimeType) {
-        await ai.files.delete({ name: uploadedFileName }).catch(() => undefined);
-        throw new Error("Gemini video processing failed.");
-      }
-
-      response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: [createPartFromUri(ready.uri, ready.mimeType), prompt],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: captionSchema
-        }
-      });
-
-      // Uploaded Gemini files are temporary for this request; clean them up.
-      await ai.files.delete({ name: uploadedFileName }).catch(() => undefined);
+    if (!uploaded.name) {
+      throw new Error("Gemini Files API did not return an uploaded file name.");
     }
+
+    uploadedFileName = uploaded.name;
+    let ready = uploaded;
+
+    while (ready.state === "PROCESSING") {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      ready = await ai.files.get({ name: uploadedFileName });
+    }
+
+    if (ready.state !== "ACTIVE" || !ready.uri || !ready.mimeType) {
+      throw new Error("Gemini video processing failed.");
+    }
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: [createPartFromUri(ready.uri, ready.mimeType), prompt],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: captionSchema
+      }
+    });
 
     const segments = parseSegments(response.text || "{\"segments\":[]}");
 
@@ -159,5 +149,16 @@ export async function POST(req: Request) {
       { error: `Caption generation failed: ${message}` },
       { status: 500 }
     );
+  } finally {
+    if (uploadedFileName) {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (apiKey) {
+        const cleanupAi = new GoogleGenAI({ apiKey });
+        await cleanupAi.files.delete({ name: uploadedFileName }).catch(() => undefined);
+      }
+    }
+    if (blobUrl) {
+      await del(blobUrl).catch(() => undefined);
+    }
   }
 }
