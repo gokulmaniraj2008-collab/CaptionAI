@@ -37,7 +37,7 @@ Never commit the real API key to GitHub. Add it to Vercel as an Environment Vari
 
 Import the repository into Vercel and add `GEMINI_API_KEY` under Project Settings → Environment Variables.
 
-Gemini supports multimodal video understanding, and short videos can be passed directly as inline video data. For larger production uploads, use the Gemini Files API instead of sending the entire video inline. citeturn0search9
+Gemini supports multimodal video understanding, and short videos can be passed directly as inline video data. For larger production uploads, use the Gemini Files API instead of sending the entire video inline.
 
 ## Production note
 
